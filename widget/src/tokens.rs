@@ -191,7 +191,12 @@ fn read_rows(p: Provider, cache: &mut FileCache) -> (Vec<Row>, Vec<Meter>, bool)
         for (key, row) in &st.entries {
             if let Some(k) = key {
                 // the same message is logged once per content block: count its tokens once, pool its tool calls
-                if let Some(&i) = seen.get(k) { rows[i].tools += row.tools; continue }
+                if let Some(&i) = seen.get(k) {
+                    // streamed message: output grows across lines, so keep the biggest reading
+                    let tools = rows[i].tools + row.tools;
+                    if row.tok() > rows[i].tok() { rows[i] = row.clone() }
+                    rows[i].tools = tools; continue
+                }
                 seen.insert(*k, rows.len());
             }
             rows.push(row.clone());

@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@import "tw-animate-css";
 
 /* Claude Token Tracker tokens (Slate & teal colourway). Every colour in the app comes from here.
    Token names keep the reference's roles: --burgundy is the BRAND hue (teal), --review the ATTENTION hue (amber),

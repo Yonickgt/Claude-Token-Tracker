@@ -6,7 +6,6 @@
 #![allow(non_snake_case)]
 
 /// The corner radius Windows 11 gives a window with DWMWCP_ROUND, in points at 100% scale.
-pub const SYSTEM_RADIUS: f32 = 8.0;
 
 #[cfg(windows)]
 mod sys {

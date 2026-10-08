@@ -5,6 +5,7 @@ mod buddy;
 mod glass;
 mod menu;
 mod tokens;
+mod update;
 
 use buddy::Buddy;
 use chrono::{Local, TimeZone};
@@ -51,12 +52,12 @@ fn theme(dark: bool) -> Theme {
 // ---------------------------------------------------------------- prefs
 #[derive(Clone)]
 struct Prefs {
-    pos: Option<(f32, f32)>, size: (f32, f32), restore_h: f32, collapsed: bool, pinned: bool, top: bool, dark: bool, glass: bool,
+    pos: Option<(f32, f32)>, size: (f32, f32), restore_h: f32, collapsed: bool, pinned: bool, top: bool, dark: bool,
     provider: Provider, buddies: Vec<String>,
 }
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { pos: None, size: (440.0, 300.0), restore_h: 300.0, collapsed: false, pinned: false, top: true, dark: true, glass: false,
+        Prefs { pos: None, size: (440.0, 300.0), restore_h: 300.0, collapsed: false, pinned: false, top: true, dark: true,
             provider: Provider::Claude, buddies: vec!["mossling".into(), "ghost".into(), "capling".into()] }
     }
 }
@@ -77,7 +78,6 @@ impl Prefs {
         p.pinned = v["pinned"].as_bool().unwrap_or(false);
         p.top = v["top"].as_bool().unwrap_or(true);
         p.dark = !v["light"].as_bool().unwrap_or(false);
-        p.glass = false; // glass look removed: always the solid card
         if v["provider"] == "codex" { p.provider = Provider::Codex }
         if let Some(a) = v["buddies"].as_array() {
             p.buddies = a.iter().filter_map(|s| s.as_str()).filter(|s| buddy::SPECIES.contains(s)).take(buddy::MAX_BUDDIES).map(String::from).collect();
@@ -87,7 +87,7 @@ impl Prefs {
     fn save(&self) {
         let (x, y) = self.pos.unwrap_or((80.0, 80.0));
         let v = serde_json::json!({ "x": x, "y": y, "w": self.size.0, "h": self.size.1, "restore_h": self.restore_h,
-            "collapsed": self.collapsed, "pinned": self.pinned, "top": self.top, "light": !self.dark, "glass": self.glass,
+            "collapsed": self.collapsed, "pinned": self.pinned, "top": self.top, "light": !self.dark,
             "provider": if self.provider == Provider::Codex { "codex" } else { "claude" }, "buddies": self.buddies });
         let path = prefs_path();
         if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
@@ -178,6 +178,9 @@ struct App {
     usage: Option<Usage>,
     ptx: mpsc::Sender<Provider>,
     urx: mpsc::Receiver<(Provider, Usage)>,
+    upd: Option<update::Update>,
+    upd_rx: mpsc::Receiver<update::Update>,
+    upd_busy: Arc<AtomicBool>,
     avail: Vec<Provider>,
     buddies: Vec<Buddy>,
     last: Instant,
@@ -232,14 +235,21 @@ impl App {
                 }
             }
         });
+        // update check: once at start, then every 6 h; the header button only appears when a newer release exists
+        let (upd_tx, upd_rx) = mpsc::channel();
+        let uctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || loop {
+            if let Some(u) = update::check() { if upd_tx.send(u).is_err() { break } uctx.request_repaint() }
+            std::thread::sleep(Duration::from_secs(6 * 3600));
+        });
         let tray = make_tray(&cc.egui_ctx);
-        let mut app = App { _tray: tray, hidden: false, prefs, usage: None, ptx, urx, avail, buddies: vec![], last: Instant::now(), last_save: Instant::now(),
+        let mut app = App { _tray: tray, hidden: false, prefs, usage: None, ptx, urx, upd: None, upd_rx, upd_busy: Arc::new(AtomicBool::new(false)), avail, buddies: vec![], last: Instant::now(), last_save: Instant::now(),
             dirty: false, menu: false, pill: false, week: false, fresh: true, hwnd: None, clip_px: (0, 0), toasts: VecDeque::new(), preview: 0, menu_st: menu::MenuState::new() };
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(h) = cc.window_handle() { if let RawWindowHandle::Win32(w) = h.as_raw() { app.hwnd = Some(w.hwnd.get()) } }
         }
-        if let Some(h) = app.hwnd { glass::apply(h, app.prefs.glass) } // explicit either way: also clears the system border
+        if let Some(h) = app.hwnd { glass::apply(h, false) } // clears the system border
         app.rebuild_buddies(&cc.egui_ctx);
         app
     }
@@ -282,6 +292,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        while let Ok(u) = self.upd_rx.try_recv() { self.upd = Some(u) }
         while let Ok((p, u)) = self.urx.try_recv() {
             if p == self.prefs.provider {
                 if let Some(prev) = self.usage.take() { self.notify_changes(&prev, &u) }
@@ -317,16 +328,12 @@ impl eframe::App for App {
         if TRAY_TOGGLE.swap(false, Ordering::Relaxed) { if self.hidden { self.show(ctx) } else { self.hide(ctx) } }
 
         // flat mode: clip the window to the card's own rounded shape so nothing Windows draws at the window
-        // edge shows outside it (glass mode relies on the system's corner rounding instead)
+        // edge shows outside it
         if let Some(h) = self.hwnd { glass::strip_frame(h) }
         if let Some(h) = self.hwnd {
-            if self.prefs.glass {
-                if self.clip_px != (0, 0) { glass::clip(h, 0.0); self.clip_px = (0, 0) }
-            } else {
-                let ppp = ctx.pixels_per_point();
-                let px = ctx.input(|i| i.viewport().outer_rect).map_or((0, 0), |r| ((r.width() * ppp) as i32, (r.height() * ppp) as i32));
-                if px.0 > 0 && (px != self.clip_px || glass::region_missing(h)) { glass::clip(h, RADIUS * ppp); self.clip_px = px }
-            }
+            let ppp = ctx.pixels_per_point();
+            let px = ctx.input(|i| i.viewport().outer_rect).map_or((0, 0), |r| ((r.width() * ppp) as i32, (r.height() * ppp) as i32));
+            if px.0 > 0 && (px != self.clip_px || glass::region_missing(h)) { glass::clip(h, RADIUS * ppp); self.clip_px = px }
         }
 
         let dt = (self.last.elapsed().as_secs_f32() * 1000.0).min(100.0);
@@ -457,10 +464,7 @@ impl App {
         let (w, h) = (full.width(), full.height());
         let t = theme(self.prefs.dark);
         let p = ui.painter().clone();
-        let glass = self.prefs.glass;
-        let shell = if glass { Color32::from_rgba_unmultiplied(t.shell.r(), t.shell.g(), t.shell.b(), if self.prefs.dark { 120 } else { 150 }) } else { t.shell };
-        let radius = if glass { glass::SYSTEM_RADIUS } else { RADIUS };
-        p.rect_filled(full, radius, shell);
+        p.rect_filled(full, RADIUS, t.shell);
         // no outline stroke: any rim shows as a light ring against bright backdrops
         let now = now_ms();
         let u = self.usage.clone();
@@ -530,6 +534,37 @@ impl App {
         if self.icon_btn(ui, coll, "collapse", t, glyph).clicked() { self.toggle_collapse(&ctx) }
         right -= btn + 4.0;
 
+        // update button: only exists while a newer release is waiting (StudyList-style)
+        if let Some(up) = self.upd.clone().filter(|_| !self.prefs.collapsed) {
+            let bw = if full.width() >= 300.0 { 66.0 } else { btn }; // narrow window: icon only
+            let busy = self.upd_busy.load(Ordering::Relaxed);
+            let r = Rect::from_min_size(Pos2::new(right - bw, y), Vec2::new(bw, btn));
+            let resp = ui.interact(r, egui::Id::new("update"), Sense::click()).on_hover_text(format!("Install {}", up.tag));
+            let shape = if bw > btn { r } else { Rect::from_center_size(r.center(), Vec2::splat(15.0)) }; // narrow: small circle
+            let ph = (ctx.input(|i| i.time) % 1.6) as f32 / 1.6; // pulse: a halo grows out and fades, ~1.6 s loop
+            if !busy {
+                p.rect_filled(shape.expand(7.0 * ph), 20.0, t.good.gamma_multiply(0.45 * (1.0 - ph)));
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+            p.rect_filled(shape, 20.0, if resp.hovered() { t.good } else { t.good.gamma_multiply(0.85) });
+            if bw > btn { p.text(r.center(), Align2::CENTER_CENTER, if busy { "Updating…" } else { "Update" }, FontId::new(12.0, FontFamily::Name("display".into())), Color32::WHITE); }
+            else { // down arrow
+                let (m, st) = (r.center(), Stroke::new(1.5, Color32::WHITE));
+                p.line_segment([m + Vec2::new(0.0, -3.5), m + Vec2::new(0.0, 3.5)], st);
+                p.line_segment([m + Vec2::new(-3.0, 0.5), m + Vec2::new(0.0, 3.5)], st);
+                p.line_segment([m + Vec2::new(3.0, 0.5), m + Vec2::new(0.0, 3.5)], st);
+            }
+            if resp.clicked() && !busy {
+                self.upd_busy.store(true, Ordering::Relaxed);
+                let (busy, ctx2) = (self.upd_busy.clone(), ctx.clone());
+                std::thread::spawn(move || match update::install(&up) {
+                    Ok(()) => std::process::exit(0),
+                    Err(_) => { busy.store(false, Ordering::Relaxed); ctx2.request_repaint() }
+                });
+            }
+            right -= bw + 6.0;
+        }
+
         // provider pill ("All work" slot): only when there is room and more than one tool to pick
         if !self.prefs.collapsed && full.width() >= 270.0 {
             let pill = Rect::from_min_size(Pos2::new(right - 104.0, y), Vec2::new(104.0, btn));
@@ -563,7 +598,7 @@ impl App {
         let title_rect = Rect::from_min_max(Pos2::new(full.min.x + 12.0, full.min.y), Pos2::new((right).max(full.min.x + 60.0), full.min.y + HEADER_H));
         let title = if self.prefs.collapsed {
             match u.and_then(|u| u.session.as_ref().map(|s| pct_left(s.used, s.limit))).or(u.map(|_| 100)) {
-                Some(l) => format!("Token Tracker · {l}% left"), None => "Token Tracker".into() }
+                Some(l) => format!("Token Tracker: {l}%"), None => "Token Tracker".into() }
         } else { "Token Tracker".into() };
         p.with_clip_rect(title_rect).text(Pos2::new(title_rect.min.x, title_rect.center().y + 1.0), Align2::LEFT_CENTER, title,
             FontId::new(13.0, FontFamily::Name("display".into())), t.ink);
@@ -647,9 +682,7 @@ impl App {
     }
 
     fn card(&self, ui: &egui::Ui, r: Rect, fill: Color32) {
-        // on glass the cards are thin frosted panes instead of solid fills
-        let fill = if !self.prefs.glass { fill } else if fill == theme(self.prefs.dark).dcard { Color32::from_rgba_unmultiplied(24, 34, 52, 150) } else { Color32::from_white_alpha(if self.prefs.dark { 14 } else { 110 }) };
-        let cr = if self.prefs.glass { 10.0 } else { 16.0 }; // inner corners stay smaller than the shell's
+        let cr = 16.0;
         ui.painter().rect_filled(r, cr, fill);
         ui.painter().rect_stroke(r.shrink(0.5), cr, Stroke::new(1.0, if self.prefs.dark { Color32::from_white_alpha(10) } else { Color32::from_white_alpha(90) }), StrokeKind::Inside);
     }
@@ -871,7 +904,7 @@ impl App {
 
     fn draw_menu(&mut self, ui: &mut egui::Ui, full: Rect, _t: &Theme) {
         let ctx = ui.ctx().clone();
-        let (top, pinned, dark, glass) = (self.prefs.top, self.prefs.pinned, self.prefs.dark, self.prefs.glass);
+        let (top, pinned, dark) = (self.prefs.top, self.prefs.pinned, self.prefs.dark);
         // a tree: switches are lit (accent line drawn along the branch) when on; buddies fold like a dropdown
         let item = |id: &str, label: &str, on: Option<bool>| menu::Item { id: id.into(), label: label.into(), on };
         let sections = vec![
@@ -893,7 +926,7 @@ impl App {
                 });
             });
         });
-        let (mut top, mut pinned, mut dark, mut glass) = (top, pinned, dark, glass);
+        let (mut top, mut pinned, mut dark) = (top, pinned, dark);
         let mut buddies = self.prefs.buddies.clone();
         let mut changed = false;
         if let Some(id) = clicked {
@@ -902,7 +935,6 @@ impl App {
                 "top" => top = !top,
                 "lock" => pinned = !pinned,
                 "dark" => dark = !dark,
-                "glass" => glass = !glass,
                 "preview" => { self.preview_toast(); changed = false }
                 s => {
                     if let Some(i) = buddies.iter().position(|b| b == s) { buddies.remove(i); }
@@ -914,8 +946,6 @@ impl App {
             if top != self.prefs.top { ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal })) }
             let rebuild = buddies != self.prefs.buddies;
             self.prefs.top = top; self.prefs.pinned = pinned; self.prefs.dark = dark; self.prefs.buddies = buddies;
-            if let Some(h) = self.hwnd { glass::apply(h, glass) }
-            self.prefs.glass = glass;
             if rebuild { self.rebuild_buddies(&ctx) }
             self.touch();
         }

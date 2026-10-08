@@ -1,0 +1,30 @@
+# Push a tag like v0.2.0 -> builds the widget, wraps it in an installer, publishes a GitHub Release.
+# The widget's Update button looks for this release's "*-Setup.exe" asset.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          if ((Select-String -Path widget/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value -ne $v) { throw "Cargo.toml version != tag $v" }
+      - run: cargo build --release
+        working-directory: widget
+      - run: choco install innosetup -y --no-progress
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" widget\installer.iss
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: widget/Output/*-Setup.exe
+          generate_release_notes: true

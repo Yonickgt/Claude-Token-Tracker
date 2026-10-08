@@ -42,7 +42,7 @@ def cost(r):
     return 0.0 if p is None else (r.inp * p[0] + r.out * p[1] + r.cw * p[2] + r.cache_read * p[3]) / 1e6
 
 def load():
-    seen, rows = set(), []
+    seen, rows = {}, []  # key -> index in rows
     for f in glob.glob(os.path.expanduser("~/.claude/projects/**/*.jsonl"), recursive=True):
         project = os.path.basename(os.path.dirname(f)).split("-")[-1] or "?"
         root = None  # the first cwd in a conversation is its project root; later ones drift into subfolders
@@ -53,16 +53,19 @@ def load():
                     root = os.path.basename(d["cwd"].replace("\\", "/").rstrip("/")) or None
                 m, u = d["message"], d["message"]["usage"]
                 key = (m.get("id"), d.get("requestId"))
-                if key[0] and key in seen:
-                    continue
-                seen.add(key)
                 inp, out, cw = u.get("input_tokens", 0), u.get("output_tokens", 0), u.get("cache_creation_input_tokens", 0)
                 cr = u.get("cache_read_input_tokens", 0)
                 model = m.get("model", "?")
                 if model.startswith("<") or not (inp + out + cw + cr):
                     continue
                 ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
-                rows.append(Row(ts, model, inp + out + cw, cr, root or project, inp, out, cw))
+                row = Row(ts, model, inp + out + cw, cr, root or project, inp, out, cw)
+                if key[0] and key in seen:  # streamed message logged several times: output grows, so keep the biggest
+                    if row.tok > rows[seen[key]].tok:
+                        rows[seen[key]] = row
+                    continue
+                seen[key] = len(rows)
+                rows.append(row)
             except (KeyError, ValueError, TypeError, AttributeError):
                 pass
     return sorted(rows)
