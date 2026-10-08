@@ -17,7 +17,8 @@ def rows():
 ms = lambda d: int(d.timestamp() * 1000)
 
 def usage():
-    c, now, rs = t.cfg(), datetime.now(timezone.utc), rows()
+    now, rs = datetime.now(timezone.utc), rows()
+    c = t.apply(t.cfg(), rs)  # real account numbers replace the hand-set limits and reset times
     bl = t.blocks(rs, t.pin(c))
     ws = t.week_start(now, c)
     wk = [r for r in rs if r.ts >= ws]
@@ -39,8 +40,8 @@ def usage():
     cur = block(bl[-1]) if bl and now < bl[-1][1] else None
     return {
         "now": ms(now), "config": c,
-        "session": cur and {**cur, "used": cur["tokens"], "limit": c["limit5h"]},
-        "week": {"start": ms(ws), "end": ms(ws + timedelta(days=7)), "used": sum(r.tok for r in wk), "limit": c["limitWeek"],
+        "session": cur and {**cur, "used": t.shown(cur["tokens"], c["limit5h"], c.get("pct5h")), "limit": c["limit5h"]},
+        "week": {"start": ms(ws), "end": ms(ws + timedelta(days=7)), "used": t.shown(sum(r.tok for r in wk), c["limitWeek"], c.get("pctWeek")), "limit": c["limitWeek"],
                  "models": t.by(wk, lambda r: r.model), "projects": t.by(wk, lambda r: r.project),
                  "input": sum(r.inp for r in wk), "output": sum(r.out for r in wk), "cacheWrite": sum(r.cw for r in wk),
                  "cacheRead": sum(r.cache_read for r in wk), "cost": round(sum(map(t.cost, wk)), 2)},

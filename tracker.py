@@ -1,5 +1,5 @@
 """Claude token tracker core + terminal view: python tracker.py [--watch]"""
-import glob, json, os, sys, time
+import glob, json, os, sys, time, urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -67,6 +67,68 @@ def load():
                 pass
     return sorted(rows)
 
+# ---- live account meter -------------------------------------------------------------------
+# This asks Anthropic for the same percentages the /usage screen shows. They cover every device and
+# claude.ai chats, not just this PC. Each reading is saved next to this file together with this PC's
+# own token count, and the token limit is worked out from those readings, so nobody sets it by hand.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+SNAP = os.path.join(HERE, "usage-snapshots.jsonl")  # ts, s_/w_ pct, reset (epoch s), tok (this PC's tokens in that window)
+POLL = 30  # seconds between asks; ponytail: Anthropic doesn't document this address, so ask gently
+_last_try = 0.0
+
+def fetch():
+    try:
+        tok = json.load(open(os.path.expanduser("~/.claude/.credentials.json")))["claudeAiOauth"]["accessToken"]
+        req = urllib.request.Request(USAGE_URL, headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+        d = json.load(urllib.request.urlopen(req, timeout=10))
+        out = {}
+        for k, name in (("s", "five_hour"), ("w", "seven_day")):
+            x = d.get(name) or {}  # a missing five_hour means no session is running
+            out[k + "_pct"] = x.get("utilization") or 0
+            out[k + "_reset"] = datetime.fromisoformat(x["resets_at"]).timestamp() if x.get("resets_at") else 0
+        return out
+    except (OSError, KeyError, ValueError, TypeError):
+        return None  # no internet or the login expired: keep using the last reading
+
+def live(rows):
+    global _last_try
+    try:
+        S = [json.loads(l) for l in open(SNAP, encoding="utf-8")]
+    except (OSError, ValueError):
+        S = []
+    if time.time() - _last_try >= POLL and (d := fetch()):
+        _last_try = time.time()
+        for k, hours in (("s", 5), ("w", 168)):
+            since = d[k + "_reset"] - hours * 3600
+            d[k + "_tok"] = sum(r.tok for r in rows if r.ts.timestamp() >= since)
+        d["ts"] = _last_try
+        S.append(d)
+        with open(SNAP, "a", encoding="utf-8") as f:
+            f.write(json.dumps(d) + "\n")
+    return S
+
+def fit(S, k, default):
+    """Token limit = this PC's tokens divided by the fraction used. Other devices make that number too low,
+    never too high, so take the biggest.
+    ponytail: readings under 10% are skipped because the percentage is a whole number, so the result swings too much."""
+    r = [x[k + "_tok"] * 100 / x[k + "_pct"] for x in S[-300:] if x[k + "_pct"] >= 10]
+    return round(max(r)) if r else default
+
+def apply(c, rows):
+    """Replace the hand-set numbers with the real ones. Adds pct5h/pctWeek (exact %)."""
+    S = live(rows)
+    if not S:
+        return c
+    L, now = S[-1], time.time()
+    loc = datetime.fromtimestamp(L["w_reset"], timezone.utc).astimezone()
+    return {**c, "weekDay": loc.weekday(), "weekHour": loc.hour, "sessionEnd": int(L["s_reset"] * 1000),
+            "limit5h": fit(S, "s", c["limit5h"]), "limitWeek": fit(S, "w", c["limitWeek"]),
+            "pct5h": L["s_pct"] if L["s_reset"] > now else 0, "pctWeek": L["w_pct"] if L["w_reset"] > now else 0}
+
+def shown(used, limit, pct):
+    """Tokens to display: the real % of the limit when we have it, otherwise this PC's own count."""
+    return used if pct is None else round(pct / 100 * limit)
+
 def pin(c):
     e = c.get("sessionEnd") or 0
     return (datetime.fromtimestamp(e / 1000 - 5 * 3600, timezone.utc), datetime.fromtimestamp(e / 1000, timezone.utc)) if e else None
@@ -113,24 +175,26 @@ def left(td):
     s = max(0, int(td.total_seconds()))
     return f"{s//3600}h {s%3600//60:02d}m"
 
-def panel(title, rows, limit, end, now):
-    used = sum(r.tok for r in rows)
+def panel(title, rows, limit, end, now, pct=None):
+    total = sum(r.tok for r in rows)
+    used = shown(total, limit, pct)
     print(f"\n{title}  resets in {left(end - now)}")
     print(f"  {bar(used/limit)} {used/limit:.0%} used, {max(0, 1-used/limit):.0%} left")
     print(f"  used {fmt(used)} / {fmt(limit)}   expected left {fmt(max(0, limit - used))}")
     for m, t in sorted(by(rows, lambda r: r.model).items(), key=lambda x: -x[1]):
-        print(f"    {m:<32}{fmt(t):>9}  {t/used:.0%}")
+        print(f"    {m:<32}{fmt(t):>9}  {t/(total or 1):.0%}")
 
 def render():
-    c, now, rows = cfg(), datetime.now(timezone.utc), load()
+    now, rows = datetime.now(timezone.utc), load()
+    c = apply(cfg(), rows)
     print(f"Claude usage  {now.astimezone():%a %H:%M}")
     b = blocks(rows, pin(c))
     if b and now < b[-1][1]:
-        panel("5h SESSION", b[-1][2], c["limit5h"], b[-1][1], now)
+        panel("5h SESSION", b[-1][2], c["limit5h"], b[-1][1], now, c.get("pct5h"))
     else:
         print("\n5h SESSION  no active session (starts on next message)")
     ws = week_start(now, c)
-    panel("WEEK", [r for r in rows if r.ts >= ws], c["limitWeek"], ws + timedelta(days=7), now)
+    panel("WEEK", [r for r in rows if r.ts >= ws], c["limitWeek"], ws + timedelta(days=7), now, c.get("pctWeek"))
     print(f"\nall-time {fmt(sum(r.tok for r in rows))} tokens, cache reads {fmt(sum(r.cache_read for r in rows))} (not counted)")
 
 if __name__ == "__main__":
